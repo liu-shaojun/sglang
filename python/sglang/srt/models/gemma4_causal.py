@@ -515,9 +515,12 @@ class Gemma4Attention(nn.Module):
     def fused_input_norm_qkv(
         self, hidden_states: torch.Tensor, input_norm: RMSNorm
     ) -> Optional[torch.Tensor]:
-        weight = self.qkv_proj.weight
+        # GGUF-quantized layers register `qweight`, not `weight`; this fused
+        # fp8 fast path does not apply to them, so bail out before touching it.
+        weight = getattr(self.qkv_proj, "weight", None)
         if (
-            _esimd_rmsnorm_gemv_fp8 is None
+            weight is None
+            or _esimd_rmsnorm_gemv_fp8 is None
             or os.environ.get(
                 "SGLANG_GEMMA4_DISABLE_FUSED_QKV_PROJ", "0"
             )
@@ -899,8 +902,12 @@ class Gemma4DecoderLayer(nn.Module):
         if self.enable_moe_block:
             dense_activation = None
             gate_up_proj = self.mlp.gate_up_proj
+            # GGUF-quantized layers register `qweight`, not `weight`; this fused
+            # fp8 fast path does not apply to them, so bail out before touching it.
+            gate_up_weight = getattr(gate_up_proj, "weight", None)
             if (
-                _esimd_norm_add_norm_gemv_gelu_fp8 is not None
+                gate_up_weight is not None
+                and _esimd_norm_add_norm_gemv_gelu_fp8 is not None
                 and os.environ.get(
                     "SGLANG_GEMMA4_DISABLE_FUSED_DENSE", "0"
                 )
@@ -909,9 +916,9 @@ class Gemma4DecoderLayer(nn.Module):
                 and hidden_states.dtype == torch.float16
                 and hidden_states.is_contiguous()
                 and residual.is_contiguous()
-                and gate_up_proj.weight.dtype
+                and gate_up_weight.dtype
                 in (torch.float8_e4m3fn, torch.float8_e5m2)
-                and tuple(gate_up_proj.weight.shape) == (2816, 2112)
+                and tuple(gate_up_weight.shape) == (2816, 2112)
                 and gate_up_proj.weight_scale.numel() == 1
             ):
                 if not hasattr(gate_up_proj, "_gemma4_weight_nk"):
@@ -986,8 +993,11 @@ class Gemma4DecoderLayer(nn.Module):
             else:
                 hidden_states_1 = self.mlp(hidden_states)
             router = self.router
+            # GGUF-quantized layers register `qweight`, not `weight`.
+            router_weight = getattr(router.proj, "weight", None)
             if (
-                _esimd_norm_gemv_norm_fp16 is not None
+                router_weight is not None
+                and _esimd_norm_gemv_norm_fp16 is not None
                 and os.environ.get(
                     "SGLANG_GEMMA4_DISABLE_FUSED_ROUTER", "0"
                 )
@@ -995,8 +1005,8 @@ class Gemma4DecoderLayer(nn.Module):
                 and moe_input.shape[0] == 1
                 and moe_input.dtype == torch.float16
                 and moe_input.is_contiguous()
-                and router.proj.weight.dtype == torch.float16
-                and router.proj.weight.is_contiguous()
+                and router_weight.dtype == torch.float16
+                and router_weight.is_contiguous()
                 and self.pre_feedforward_layernorm_2.weight.dtype
                 == torch.float16
             ):

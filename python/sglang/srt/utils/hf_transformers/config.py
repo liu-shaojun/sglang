@@ -292,4 +292,38 @@ def get_config(
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
+    if is_gguf and os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR"):
+        config = _maybe_gguf_gemma4_text_only(config)
+
     return config
+
+
+def _maybe_gguf_gemma4_text_only(config):
+    """Collapse a multimodal gemma4 config to its text tower for GGUF runs.
+
+    The published gemma-4 GGUFs (26B-A4B and 31B) contain the TEXT tower only —
+    there is not a single vision / audio tensor in the file — while the sibling
+    HF ``config.json`` declares ``Gemma4ForConditionalGeneration``.  Running the
+    multimodal entry would build vision (and, for the 26B, audio) towers that no
+    weight ever fills.  ``Gemma4ForCausalLM`` is the text-only entry and its
+    ``config_class`` is ``Gemma4TextConfig``, so hand it the nested text config
+    with the generation-relevant top-level ids carried over.
+
+    Set ``SGLANG_GGUF_GEMMA4_KEEP_MM=1`` to opt out and keep the multimodal arch.
+    """
+    if getattr(config, "model_type", None) != "gemma4":
+        return config
+    if os.environ.get("SGLANG_GGUF_GEMMA4_KEEP_MM", "0") == "1":
+        return config
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return config
+
+    # bos/eos live on the multimodal config; the text config carries only the
+    # single-id defaults, which would break stop handling for the IT models.
+    for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            setattr(text_config, attr, value)
+    _set_architectures(text_config, "Gemma4ForCausalLM")
+    return text_config
