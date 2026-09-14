@@ -660,6 +660,11 @@ class Envs:
     # at each TP all-reduce, running the (non-capturable) oneCCL collective eager
     # between segments. Fixes the TP>1 XPU-graph decode garble.
     SGLANG_XPU_BREAKABLE_GRAPH = EnvBool(False)
+    # XPU GDN kernels for MTP target verification and per-token state snapshots.
+    # MTP launchers enable this explicitly; ordinary inference defaults to off.
+    SGL_XPU_MTP_GDN_VERIFY = EnvBoolWithAlias(
+        False, deprecated_name="SGL_XPU_GDN_VERIFY_ESIMD"
+    )
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -936,6 +941,13 @@ def _convert_SGL_to_SGLANG():
             os.environ[new_name] = str(float(ms_val) / 1000.0)
 
     for key, value in os.environ.items():
+        # Keep this downstream XPU option in the SGL_XPU namespace. Its
+        # legacy spelling is handled by EnvBoolWithAlias above.
+        if key in (
+            envs.SGL_XPU_MTP_GDN_VERIFY.name,
+            envs.SGL_XPU_MTP_GDN_VERIFY.deprecated_name,
+        ):
+            continue
         if key.startswith("SGL_"):
             new_key = key.replace("SGL_", "SGLANG_", 1)
             warnings.warn(

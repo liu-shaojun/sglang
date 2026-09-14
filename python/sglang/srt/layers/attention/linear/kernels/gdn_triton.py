@@ -1,5 +1,6 @@
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -296,11 +297,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # fp32 or fp16/bf16 (SGLANG_MAMBA_SSM_DTYPE); the recurrence always runs
         # in fp32 registers either way. topk=1 (linear chain) only. Env-gated so
         # rollback is a one-liner.
-        import os as _os
-
         if (
             is_xpu()
-            and _os.environ.get("SGL_XPU_GDN_VERIFY_ESIMD") == "1"
+            and envs.SGL_XPU_MTP_GDN_VERIFY.get()
             and q.size(-1) == 128
             and v.size(-1) == 128
             and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)

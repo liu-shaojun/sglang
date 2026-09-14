@@ -1,9 +1,9 @@
 import logging
-import os
 from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
@@ -426,7 +426,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # retrieve_next_token/sibling/parent tree walk.
             _use_esimd_verify_conv = (
                 is_xpu()
-                and os.environ.get("SGL_XPU_GDN_VERIFY_ESIMD") == "1"
+                and envs.SGL_XPU_MTP_GDN_VERIFY.get()
                 and hasattr(torch.ops, "eagle_ops")
                 and hasattr(torch.ops.eagle_ops, "causal_conv1d_verify")
             )
