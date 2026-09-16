@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
+import sys
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
+
+_MAMBA_DEBUG = os.environ.get("SGLANG_MAMBA_HICACHE_DEBUG", "0") == "1"
+
+def _mamba_debug(msg: str):
+    if _MAMBA_DEBUG:
+        print(f"[MAMBA_DEBUG] {msg}", file=sys.stderr, flush=True)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -53,8 +61,20 @@ class MambaComponent(TreeComponent):
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
+        # Hoisted out of finalize_match_result by #31181; this branch reads it through
+        # get_global_server_args(), which upstream later renamed to get_server_args().
+        self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        # #31181 also caches server_args.mamba_max_states_per_path here, but never reads
+        # it -- it is groundwork for a later commit. This branch has no such server arg,
+        # so keeping the line would raise AttributeError at component construction for
+        # every hybrid model, HiCache or not. Restore it together with the arg if a
+        # later port actually needs it.
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
+
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        data = node.component_data[self.component_type]
+        return data.value is not None and data.host_value is None
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -80,17 +100,23 @@ class MambaComponent(TreeComponent):
         req = params.req
         last_node = result.best_match_node
 
-        # HiCache can still use prefix matches and load back host-backed Mamba
-        # states. We temporarily skip branching-state fill in that mode and can
-        # add a HiCache-aware branching policy later.
-        if self.cache.cache_controller is None and len(value_chunks) > best_value_len:
-            chunk_size = get_global_server_args().mamba_cache_chunk_size
-            aligned_seqlen = (
-                sum(len(v) for v in value_chunks) // chunk_size
-            ) * chunk_size
-            branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
-        else:
-            branching_seqlen = None
+        # This block previously ran only when `cache_controller is None`, i.e. branching
+        # was DISABLED whenever HiCache was on -- the deliberately temporary workaround
+        # #25277 introduced. #31181 removes that gate, which is the whole point of taking
+        # it: without this, the 35B hybrid model gets no Mamba branching under HiCache.
+        mamba_boundary_len = len(result.device_indices) + result.host_hit_length
+
+        # Full KV may extend beyond the latest reusable Mamba state. The branching
+        # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
+        # that lies beyond the current Mamba boundary. With HiCache, incremental
+        # persistence of a new branching state is currently write-through only;
+        # write-back eviction may discard the device-only state.
+        aligned_seqlen = (
+            result.full_kv_hit_length // self.mamba_cache_chunk_size
+        ) * self.mamba_cache_chunk_size
+        branching_seqlen = (
+            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
+        )
 
         mamba_value = last_node.component_data[self.component_type].value
         if cow_mamba and mamba_value is not None:

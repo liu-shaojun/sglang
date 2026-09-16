@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -331,8 +332,25 @@ class HiCacheController:
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        # DIAGNOSTIC ONLY (added 2026-08-18, BMG DEVICE_LOST bisect).
+        # SGLANG_HICACHE_SINGLE_STREAM=1 puts the KV copies on the SAME queue as compute
+        # instead of two dedicated ones. That removes every cross-queue event dependency
+        # on the write/load path while leaving the copies themselves, the pinned host
+        # pool and HiRadixCache untouched -- so it separates "the two queues fail to
+        # signal each other" from "the copy itself kills the device".
+        # It is not a fix: serialising the copies behind compute forfeits the overlap
+        # that is the entire point of the host tier.
+        if os.environ.get("SGLANG_HICACHE_SINGLE_STREAM", "0") == "1":
+            self.write_stream = device_module.current_stream()
+            self.load_stream = device_module.current_stream()
+            logger.warning(
+                "SGLANG_HICACHE_SINGLE_STREAM=1: HiCache write/load copies share the "
+                "compute stream. Diagnostic only -- removes copy/compute overlap. Do "
+                "not use for performance results."
+            )
+        else:
+            self.write_stream = device_module.Stream()
+            self.load_stream = device_module.Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -683,7 +701,9 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             # KV geometry, so an L3 entry cannot be read back under a different encoding.
-            kv_cache_dtype=kv_cache_dtype,
+            # Read from the device pool rather than ServerArgs because that is the dtype
+            # actually in use after "auto" has been resolved against the model.
+            kv_cache_dtype=str(getattr(self.mem_pool_device, "dtype", None)),
             page_size=getattr(self.mem_pool_device, "page_size", None),
             extra_config=storage_backend_extra_config,
         )

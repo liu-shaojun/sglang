@@ -3287,15 +3287,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[MODEL_RUNNER] forward_decode: enter, batch_size={forward_batch.batch_size}", flush=True)
         if not self.server_args.enable_pdmux and self.device == "cuda":
             forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
         # Set extra arguments
         pdmux_override = False
         if forward_batch.needs_forward_metadata_init():
+            if _debug:
+                print(f"[MODEL_RUNNER] forward_decode: needs_forward_metadata_init", flush=True)
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
+                if _debug:
+                    print(f"[MODEL_RUNNER] forward_decode: calling prepare_forward_batch", flush=True)
                 self.model.prepare_forward_batch(forward_batch)
+                if _debug:
+                    print(f"[MODEL_RUNNER] forward_decode: prepare_forward_batch returned", flush=True)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 # PDmux selects a per-stream backend; publish it to model-layer
@@ -3303,7 +3313,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # dispatch against the right backend for this forward.
                 pdmux_override = True
             else:
+                if _debug:
+                    print(f"[MODEL_RUNNER] forward_decode: calling attn_backend.init_forward_metadata", flush=True)
                 self.attn_backend.init_forward_metadata(forward_batch)
+                if _debug:
+                    print(f"[MODEL_RUNNER] forward_decode: attn_backend.init_forward_metadata returned", flush=True)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -3317,12 +3331,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         def _do_forward():
-            return self.model.forward(
+            if _debug:
+                print(f"[MODEL_RUNNER] _do_forward: calling model.forward", flush=True)
+            result = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
             )
+            if _debug:
+                print(f"[MODEL_RUNNER] _do_forward: model.forward returned", flush=True)
+            return result
 
         with ctx:
             if pdmux_override:
@@ -3495,6 +3514,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[MODEL_RUNNER] forward: enter, mode={forward_batch.forward_mode}", flush=True)
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
@@ -3534,12 +3557,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if _debug:
+                print(f"[MODEL_RUNNER] forward: calling _forward_raw", flush=True)
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if _debug:
+                print(f"[MODEL_RUNNER] forward: _forward_raw returned", flush=True)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
@@ -3589,6 +3616,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[MODEL_RUNNER] _forward_raw: enter, mode={forward_batch.forward_mode}", flush=True)
         # Honor an outer-published context (spec workers wrap each per-step
         # draft forward with the i-th child backend); otherwise publish this
         # runner's own attn_backend for the forward.
@@ -3607,6 +3638,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.graph_runner
                 and self.graph_runner.can_run(forward_batch)
             )
+            if _debug:
+                print(f"[MODEL_RUNNER] _forward_raw: can_run_graph={can_run_graph}", flush=True)
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if (

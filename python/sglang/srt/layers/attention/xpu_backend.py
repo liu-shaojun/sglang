@@ -646,10 +646,16 @@ class XPUAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[XPU_BACKEND] init_forward_metadata: enter, mode={forward_batch.forward_mode}", flush=True)
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
+        if _debug:
+            print(f"[XPU_BACKEND] init_forward_metadata: created metadata, batch_size={batch_size}", flush=True)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode

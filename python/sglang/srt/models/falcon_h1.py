@@ -326,23 +326,33 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        _layer_id = kwargs.get("layer_id", -1)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
 
         if not forward_batch.forward_mode.is_idle():
+            if _debug and _layer_id == 0:
+                print(f"[FALCON_LAYER] layer 0: calling self_attention", flush=True)
             # Attention block
             attention_hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states * self.attention_in_multiplier,
                 forward_batch=forward_batch,
             )
+            if _debug and _layer_id == 0:
+                print(f"[FALCON_LAYER] layer 0: self_attention done", flush=True)
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
             attn_backend = get_attn_backend()
             assert isinstance(attn_backend, HybridLinearAttnBackend)
             assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
+            if _debug and _layer_id == 0:
+                print(f"[FALCON_LAYER] layer 0: calling mamba forward", flush=True)
             mamba_hidden_states = torch.empty_like(hidden_states)
             attn_backend.linear_attn_backend.forward(
                 self.mamba,
@@ -352,6 +362,8 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
             )
+            if _debug and _layer_id == 0:
+                print(f"[FALCON_LAYER] layer 0: mamba forward done", flush=True)
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
             hidden_states = attention_hidden_states + mamba_hidden_states
@@ -424,6 +436,8 @@ class FalconH1Model(nn.Module):
         # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
@@ -435,6 +449,8 @@ class FalconH1Model(nn.Module):
 
         residual = None
         for i in range(len(self.layers)):
+            if _debug and i == 0:
+                print(f"[FALCON_MODEL] forward: starting layer loop, mode={forward_batch.forward_mode}, batch_size={forward_batch.batch_size}", flush=True)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 layer_id=i,
@@ -443,6 +459,8 @@ class FalconH1Model(nn.Module):
                 residual=residual,
                 forward_batch=forward_batch,
             )
+            if _debug and i == 0:
+                print(f"[FALCON_MODEL] forward: layer 0 done", flush=True)
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:

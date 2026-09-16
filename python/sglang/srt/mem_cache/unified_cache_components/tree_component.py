@@ -122,6 +122,10 @@ class TreeComponent(ABC):
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether this component has new device data missing from Host."""
+        return False
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,

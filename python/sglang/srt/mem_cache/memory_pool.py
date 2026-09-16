@@ -645,6 +645,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        """Virtual->physical mamba-slot translate. Identity for a static pool
+        (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
+        unified memory pool, where mamba slot ids are virtual. Callers translate
+        before calling the pool's physical-id state ops (copy_from / clear_slots
+        / get_cpu_copy / load_cpu_copy)."""
+        return mamba_indices
+
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:

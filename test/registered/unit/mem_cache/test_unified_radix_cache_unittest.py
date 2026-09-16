@@ -2956,6 +2956,109 @@ class UnifiedRadixCacheSuite:
         self.assertIs(with_hicache.last_device_node, tree_h.root_node)
         self.assertIsNone(with_hicache.mamba_branching_seqlen)
 
+    def test_mamba_branching_seqlen_uses_device_full_hit_under_hicache(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        prefix = self._make_seq(1, chunk_size)
+        tokens = prefix + self._make_seq(1000, chunk_size + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        parent = leaf.parent
+        leaf.component_data[ComponentType.MAMBA].value = None
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, parent)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), chunk_size)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        self.assertEqual(result.mamba_branching_seqlen, 2 * chunk_size)
+
+    def test_mamba_branching_from_host_full_is_reusable_after_insert(self):
+        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1 Full+Mamba")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chunk_size = get_global_server_args().mamba_cache_chunk_size
+        prefix = self._make_seq(1, chunk_size)
+        tokens = prefix + self._make_seq(1000, chunk_size + 1)
+        self._insert(cache, allocator, req_to_token_pool, prefix)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        parent = leaf.parent
+        self._backup_node(cache, leaf)
+        lock_result = cache.inc_lock_ref(parent)
+        try:
+            cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        finally:
+            cache.dec_lock_ref(
+                parent,
+                DecLockRefParams(
+                    swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
+                ),
+            )
+        self.assertTrue(leaf.evicted)
+        self.assertTrue(leaf.backuped)
+        cache.components[ComponentType.MAMBA].evict_component(
+            leaf, target=EvictLayer.HOST
+        )
+        # Upstream frees through _collect_component_frees()/_free_values(); this branch
+        # evicts via evict_component() just above, so only the measurements port over.
+        full_host_pool = cache.cache_controller.mem_pool_host
+        mamba_host_pool = cache.components[ComponentType.MAMBA]._mamba_pool_host
+        full_available_before = full_host_pool.available_size()
+        mamba_available_before = mamba_host_pool.available_size()
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+
+        self.assertIs(result.best_match_node, parent)
+        self.assertIs(result.last_device_node, parent)
+        self.assertEqual(len(result.device_indices), chunk_size)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(result.full_kv_hit_length, len(tokens))
+        branching_seqlen = 2 * chunk_size
+        self.assertEqual(result.mamba_branching_seqlen, branching_seqlen)
+
+        self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            tokens[:branching_seqlen],
+        )
+        cache.writing_check(write_back=True)
+        # Full was already backed up, so only one Mamba slot is allocated.
+        self.assertEqual(
+            full_host_pool.available_size(),
+            full_available_before,
+        )
+        self.assertEqual(
+            mamba_host_pool.available_size(),
+            mamba_available_before - 1,
+        )
+
+        second_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+
+        self.assertEqual(len(second_match.device_indices), branching_seqlen)
+        self.assertIsNone(second_match.mamba_branching_seqlen)
+        # Upstream returns opaque node handles and resolves them via
+        # cache.resolve_node_handle(); on this branch MatchResult carries the node
+        # itself, as the `leaf.parent` use earlier in this test shows.
+        branching_node = second_match.last_device_node
+        self.assertIsNotNone(
+            branching_node.component_data[ComponentType.MAMBA].host_value
+        )
+
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

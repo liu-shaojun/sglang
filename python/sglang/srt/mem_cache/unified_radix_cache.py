@@ -550,6 +550,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -557,6 +558,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -824,7 +826,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -835,6 +837,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        full_kv_hit_length = 0
+
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
             validators = tuple(
@@ -877,6 +881,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
@@ -897,6 +902,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            full_kv_hit_length,
         )
 
     def _match_post_processor(
@@ -906,6 +912,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        full_kv_hit_length: int,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -939,6 +946,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            full_kv_hit_length=full_kv_hit_length,
         )
 
         for component in self._components_tuple:
@@ -1140,6 +1148,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
+        elif self._needs_incremental_component_backup(target_node):
+            # Not a new leaf, so the hit-count path above does not run -- but an
+            # existing, already-backuped node can have just gained a Mamba branching
+            # state that exists only on device. Persist it now; nothing else will.
+            self.write_backup(target_node)
         return result
 
     def _insert_helper_host(
@@ -1466,7 +1479,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- HiCache: Backup / LoadBack ----
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Backup a node's data from device to host (D->H)."""
+        """Backup a node's data from device to host (D->H).
+
+        Upstream #33639 splits this into build_backup_spec / _execute_kv_backup /
+        commit_backup driven by a BackupKV action; this branch keeps all three fused
+        here, so the same three edits land in one body: an incremental (component-only)
+        spec, an early-out when nothing is left to transfer, and a KV commit that is
+        skipped for a zero-length Full-KV backup.
+        """
         if self.cache_controller is None:
             return 0
 
@@ -1478,6 +1498,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        assert device_value is not None
+        # A node that is already backuped can still acquire NEW component data later --
+        # a Mamba branching state created after its Full KV was persisted. Re-sending
+        # the Full KV would duplicate it on host, so narrow the spec to the components
+        # that are actually missing: empty Full KV, plus only the not-yet-host-backed
+        # components. This is what makes the backup "incremental".
+        if node.backuped:
+            device_value = device_value[:0]
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
         # Build aux transfers, keyed per component.
@@ -1485,9 +1513,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
+            if node.component_data[comp.component_type].host_value is not None:
+                continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
+
+        # Nothing missing on host. Previously the caller guarded this with
+        # `if node.backuped: return`, which is exactly the check that made incremental
+        # component backup impossible; the decision now depends on what is left to send.
+        if device_value.numel() == 0 and not comp_xfers:
+            return 0
+
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -1509,13 +1546,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if host_indices is None:
             return 0
 
-        # Commit
-        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
-        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            node,
-            CacheTransferPhase.BACKUP_HOST,
-            transfers=[kv_xfer],
-        )
+        # Commit. On a component-only backup there is no Full-KV host range to record,
+        # and committing an empty one would overwrite the node's existing host_value
+        # with a zero-length tensor -- silently unbacking KV that is still on host.
+        if len(host_indices) > 0:
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+            self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=[kv_xfer],
+            )
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 node,
@@ -1728,6 +1768,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         return transfers
+
+    def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
+        """Whether an already-backuped node has device-only component data left.
+
+        Write-back is excluded deliberately: under that policy a device-only branching
+        state can still be discarded by eviction, so #33639 supports incremental
+        persistence for write-through only. See the note in MambaComponent.
+        """
+        if self.cache_controller is None:
+            return False
+        if self.cache_controller.write_policy == "write_back":
+            return False
+        if not node.backuped or node.write_through_pending_id is not None:
+            return False
+        return any(
+            comp.needs_incremental_backup(node)
+            for comp in self._components_tuple
+            if comp.component_type != BASE_COMPONENT_TYPE
+        )
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
@@ -2264,15 +2323,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def writing_check(self, write_back: bool = False) -> None:
         """Poll write-through completions."""
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[WRITING_CHECK] enter, write_back={write_back}", flush=True)
         cc = self.cache_controller
         if cc is None:
+            if _debug:
+                print("[WRITING_CHECK] no cache_controller, return", flush=True)
             return
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            if _debug:
+                print(f"[WRITING_CHECK] write_back mode, ongoing={len(self.ongoing_write_through)}", flush=True)
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
+                    if _debug:
+                        print("[WRITING_CHECK] calling finish_event.synchronize()", flush=True)
                     finish_event.synchronize()
+                    if _debug:
+                        print("[WRITING_CHECK] synchronize done", flush=True)
                     for ack_id in ack_list:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -2283,23 +2354,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
+        if _debug:
+            print(f"[WRITING_CHECK] non-write_back mode, pp_rank={self.pp_rank}, queue_len={len(cc.ack_write_queue)}", flush=True)
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
+                if _debug:
+                    print("[WRITING_CHECK] calling finish_event.query()", flush=True)
                 if not finish_event.query():
+                    if _debug:
+                        print("[WRITING_CHECK] query returned False, breaking", flush=True)
                     break
+                if _debug:
+                    print("[WRITING_CHECK] query returned True", flush=True)
                 finish_count += 1
 
+        if _debug:
+            print(f"[WRITING_CHECK] finish_count={finish_count}, calling all_reduce", flush=True)
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        if _debug:
+            print(f"[WRITING_CHECK] all_reduce done", flush=True)
         finish_count = finish_count_tensor.item()
 
         # Process completed acks
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            if _debug:
+                print("[WRITING_CHECK] calling finish_event.synchronize()", flush=True)
             finish_event.synchronize()
+            if _debug:
+                print("[WRITING_CHECK] synchronize done", flush=True)
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
+        if _debug:
+            print("[WRITING_CHECK] exit", flush=True)
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -2382,9 +2471,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
-        self.writing_check()
-        self.loading_check()
+        """Called per scheduler step to poll async HiCache events.
+
+        Optimized to batch write and load completion checks into a single
+        all_reduce call to reduce per-step synchronization overhead.
+        """
+        import os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] enter", flush=True)
+
+        cc = self.cache_controller
+        if cc is not None:
+            # Count completions locally for both write and load
+            write_finish_count = 0
+            load_finish_count = 0
+
+            if self.pp_rank == 0:
+                for _, finish_event, _ in cc.ack_write_queue:
+                    if not finish_event.query():
+                        break
+                    write_finish_count += 1
+
+                for _, finish_event, _ in cc.ack_load_queue:
+                    if not finish_event.query():
+                        break
+                    load_finish_count += 1
+
+            # Single all_reduce for both counts (halves sync overhead)
+            counts_tensor = torch.tensor(
+                [write_finish_count, load_finish_count], dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(counts_tensor, torch.distributed.ReduceOp.MIN)
+            write_finish_count = counts_tensor[0].item()
+            load_finish_count = counts_tensor[1].item()
+
+            if _debug:
+                print(f"[CHECK_HICACHE_EVENTS] batched all_reduce: write={write_finish_count}, load={load_finish_count}", flush=True)
+
+            # Process write completions
+            while write_finish_count > 0:
+                _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    self._finish_write_through_ack(ack_id)
+                write_finish_count -= 1
+
+            # Process load completions
+            while load_finish_count > 0:
+                _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+                finish_event.synchronize()
+                for ack_id in ack_list:
+                    node, lock_params = self.ongoing_load_back.pop(ack_id)
+                    self.dec_lock_ref(node, lock_params)
+                load_finish_count -= 1
+
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] sync done", flush=True)
+
         if self.enable_storage:
             self.drain_storage_control_queues()
         self._reap_completed_async_work()
@@ -2392,6 +2536,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        if _debug:
+            print("[CHECK_HICACHE_EVENTS] exit", flush=True)
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""

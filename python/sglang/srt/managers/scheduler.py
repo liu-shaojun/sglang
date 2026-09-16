@@ -3004,6 +3004,10 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        import sys, os
+        _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+        if _debug:
+            print(f"[SCHEDULER_DEBUG] run_batch: forward_ct={self.forward_ct}, forward_mode={batch.forward_mode}, batch_size={len(batch.reqs) if hasattr(batch, 'reqs') else 'N/A'}", file=sys.stderr, flush=True)
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -3052,9 +3056,13 @@ class Scheduler(
                         )
 
                         # FIXME: pp is not compatible with overlap
+                        if _debug:
+                            print(f"[SCHEDULER_DEBUG] overlap: calling forward_batch_generation", file=sys.stderr, flush=True)
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if _debug:
+                            print(f"[SCHEDULER_DEBUG] overlap: forward_batch_generation returned", file=sys.stderr, flush=True)
                         if not batch.is_spec_v2:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3123,9 +3131,13 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                if _debug:
+                    print(f"[SCHEDULER_DEBUG] calling forward_batch_generation", file=sys.stderr, flush=True)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                if _debug:
+                    print(f"[SCHEDULER_DEBUG] forward_batch_generation returned", file=sys.stderr, flush=True)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     if self.spec_algorithm.is_none():
                         # Non-spec: relay via future_map, gathered next iter.

@@ -469,10 +469,16 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            import sys, os
+            _debug = os.environ.get("SGLANG_HICACHE_DEBUG", "0") == "1"
+            if _debug:
+                print(f"[TP_WORKER] forward: mode={forward_batch.forward_mode}, batch_size={len(forward_batch.seq_lens) if hasattr(forward_batch, 'seq_lens') else 'N/A'}", file=sys.stderr, flush=True)
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if _debug:
+                print(f"[TP_WORKER] forward returned", file=sys.stderr, flush=True)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
