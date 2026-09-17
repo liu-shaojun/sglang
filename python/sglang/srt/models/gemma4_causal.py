@@ -52,7 +52,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -66,6 +69,18 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
+
+
+class Gemma4GGUFScaledWordEmbedding(VocabParallelEmbedding):
+    """GGUF-aware Gemma4 embedding with the model's required input scaling."""
+
+    def __init__(self, *args, embed_scale: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.embed_scale = embed_scale
+
+    def forward(self, input_ids: torch.Tensor):
+        return super().forward(input_ids) * self.embed_scale
+
 
 # Lazy-loaded ESIMD kernels (fp16 decode fast paths).
 _esimd_qkv_split_norm_rope = None
@@ -1258,12 +1273,21 @@ class Gemma4TextModel(PreTrainedModel):
                 )
 
         if self.pp_group.is_first_rank:
-            self.embed_tokens = Gemma4TextScaledWordEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                self.padding_idx,
-                embed_scale=self.config.hidden_size**0.5,  # embedded normalizer
-            )
+            if quant_config is not None and quant_config.get_name() == "gguf":
+                self.embed_tokens = Gemma4GGUFScaledWordEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("embed_tokens", prefix),
+                    embed_scale=self.config.hidden_size**0.5,
+                )
+            else:
+                self.embed_tokens = Gemma4TextScaledWordEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    self.padding_idx,
+                    embed_scale=self.config.hidden_size**0.5,
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1564,8 +1588,11 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # the missing side is a PPMissingLayer with no ``weight`` attribute,
         # which makes the default tie_weights crash.  load_weights routes the
         # checkpoint embedding into lm_head explicitly, so the tie is a no-op
-        # here when PP is active.
-        if self.pp_group.world_size > 1:
+        # here when PP is active. GGUF also ties the modules directly, while
+        # its quantized embedding exposes qweight rather than weight.
+        if self.pp_group.world_size > 1 or (
+            self.quant_config is not None and self.quant_config.get_name() == "gguf"
+        ):
             return
         super().tie_weights(*args, **kwargs)
 
