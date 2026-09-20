@@ -133,9 +133,10 @@ sglang serve                         \
 
 Intel XPU supports text-generation checkpoints in the GGUF Q4_K family through
 the SYCL-TLA kernels provided by `sgl-kernel-xpu`. Q4_K and Q8_0 values remain
-compact. Q6_K is prepared as signed INT8 with its 16-value group scales, which
-uses less memory than BF16 expansion. The serving path does not depend on the
-llm-scaler ESIMD extension.
+compact. Q5_K is prepared as affine INT8 codes with 32-value group scales and
+minimums, while Q6_K uses signed INT8 with 16-value group scales. Both use less
+memory than BF16 expansion. The serving path does not depend on the llm-scaler
+ESIMD extension.
 
 Place the Hugging Face sidecar files next to the GGUF file. At minimum this
 includes `config.json`, the tokenizer files, and
