@@ -608,8 +608,8 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
 
     The Q4_K gate/up projection stays quantized and runs through
     sgl-kernel-xpu's compact-metadata Q4_K grouped GEMM.  GGUF files commonly
-    use a higher precision type for the down projection. Q8_0 stays compact and
-    uses the direct INT8 grouped GEMM; remaining types are dequantized once at
+    use a higher precision type for the down projection. Q6_K and Q8_0 use
+    direct signed-INT8 grouped GEMMs; remaining types are dequantized once at
     load time and consumed by the native grouped BF16 GEMM. This preserves the
     checkpoint values instead of silently requantizing them to four bits.
     """
@@ -654,13 +654,19 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             raise ValueError(
                 f"Unsupported GGUF XPU MoE down quantization type: {w2_type.name}"
             )
-        if w2_type == WeightType.Q8_0:
+        if w2_type in (WeightType.Q6_K, WeightType.Q8_0):
             num_experts, output_features, packed_width = w2.shape
-            weights, scales = _xpu_prepare_q8_0(
+            raw_w2 = (
                 w2.detach()
                 .to(device=device, dtype=torch.uint8)
                 .reshape(num_experts * output_features, packed_width)
             )
+            if w2_type == WeightType.Q6_K:
+                weights, scales = _xpu_prepare_q6_k(raw_w2)
+                layer.w2_xpu_kind = "q6_k"
+            else:
+                weights, scales = _xpu_prepare_q8_0(raw_w2)
+                layer.w2_xpu_kind = "q8_0"
             layer.register_buffer(
                 "w2_xpu_qweight",
                 weights.reshape(num_experts, output_features, weights.shape[-1]),
@@ -671,7 +677,6 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
                 scales.reshape(num_experts, output_features, scales.shape[-1]),
                 persistent=False,
             )
-            layer.w2_xpu_kind = "q8_0"
         else:
             # sgl-kernel-xpu's dense grouped GEMM currently accepts BF16 only.
             down_dtype = torch.bfloat16
@@ -716,7 +721,7 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
         num_experts = layer.w13_xpu_qweight.shape[0]
         num_routes = topk_ids.numel()
         hidden_size = x.shape[-1]
-        if layer.w2_xpu_kind == "q8_0":
+        if layer.w2_xpu_kind in ("q6_k", "q8_0"):
             intermediate_size = layer.w2_xpu_qweight.shape[-1]
         else:
             intermediate_size = layer.w2_xpu_dequant.shape[-1]
@@ -762,18 +767,28 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
         else:
             torch.ops.sgl_kernel.gelu_tanh_and_mul(activated, gate_up)
 
-        if layer.w2_xpu_kind == "q8_0":
+        if layer.w2_xpu_kind in ("q6_k", "q8_0"):
             routed_output = torch.empty(
                 (num_routes, hidden_size), dtype=x.dtype, device=device
             )
-            torch.ops.sgl_kernel.gguf_q8_0_grouped_mm(
-                routed_output,
-                activated,
-                layer.w2_xpu_qweight,
-                layer.w2_xpu_scales,
-                expert_rows,
-                num_experts,
-            )
+            if layer.w2_xpu_kind == "q6_k":
+                torch.ops.sgl_kernel.gguf_q6_k_grouped_mm(
+                    routed_output,
+                    activated,
+                    layer.w2_xpu_qweight,
+                    layer.w2_xpu_scales,
+                    expert_rows,
+                    num_experts,
+                )
+            else:
+                torch.ops.sgl_kernel.gguf_q8_0_grouped_mm(
+                    routed_output,
+                    activated,
+                    layer.w2_xpu_qweight,
+                    layer.w2_xpu_scales,
+                    expert_rows,
+                    num_experts,
+                )
         else:
             activated_bf16 = activated.to(dtype=torch.bfloat16)
             routed_output = torch.empty(
@@ -927,10 +942,77 @@ def _xpu_prepare_q8_0(
     return weights, scales
 
 
+def _xpu_prepare_q6_k(
+    raw_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare Q6_K as signed INT8 values with one FP16 scale per 16 values."""
+    block_bytes = 210
+    values_per_block = 256
+    groups_per_block = 16
+    if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 2:
+        raise ValueError("Q6_K preparation expects a rank-2 uint8 tensor")
+    if raw_weight.shape[0] == 0:
+        raise ValueError("Q6_K preparation expects at least one row")
+    if raw_weight.shape[1] == 0 or raw_weight.shape[1] % block_bytes:
+        raise ValueError(f"Q6_K byte width must be a multiple of {block_bytes}")
+    device = torch.device("xpu", torch.xpu.current_device())
+    raw_weight = raw_weight.to(device=device).contiguous()
+    rows = raw_weight.shape[0]
+    blocks = raw_weight.shape[1] // block_bytes
+    weights = torch.empty(
+        (rows, blocks * values_per_block), dtype=torch.int8, device=device
+    )
+    scales = torch.empty(
+        (rows, blocks * groups_per_block), dtype=torch.float16, device=device
+    )
+    torch.ops.sgl_kernel.gguf_q6_k_prepare(raw_weight, weights, scales)
+    return weights, scales
+
+
+def _xpu_permute_grouped_k(
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    col_perm: tuple[int, int, int],
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the GDN ratio/head K permutation without crossing scale groups."""
+    ratio, num_key_heads, value_head_dim = col_perm
+    expected = ratio * num_key_heads * value_head_dim
+    if weights.shape[1] != expected:
+        raise ValueError(
+            "GGUF GDN column permutation does not match weight: "
+            f"K={weights.shape[1]}, expected={expected}"
+        )
+    if value_head_dim % group_size:
+        raise ValueError(
+            f"GGUF GDN value head dim {value_head_dim} must be divisible by "
+            f"quantization group size {group_size}"
+        )
+    rows = weights.shape[0]
+    weights = (
+        weights.reshape(rows, ratio, num_key_heads, value_head_dim)
+        .transpose(1, 2)
+        .reshape(weights.shape)
+        .contiguous()
+    )
+    scales = (
+        scales.reshape(
+            rows,
+            ratio,
+            num_key_heads,
+            value_head_dim // group_size,
+        )
+        .transpose(1, 2)
+        .reshape(scales.shape)
+        .contiguous()
+    )
+    return weights, scales
+
+
 class GGUFLinearXPUMethod(GGUFLinearMethod):
     """GGUF linear implementation backed by non-ESIMD XPU kernels.
 
-    Q4_K and Q8_0 weights use direct compact sgl-kernel-xpu GEMMs. Other GGUF
+    Q4_K, Q6_K, and Q8_0 weights use direct sgl-kernel-xpu GEMMs. Other GGUF
     types are dequantized once at load time and use native XPU matmul.
     """
 
@@ -972,17 +1054,27 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                         None,
                     )
                 )
-            elif qweight_type == WeightType.Q8_0 and gdn_col_perm is None:
-                weights, scales = _xpu_prepare_q8_0(
-                    raw_weight.detach().to(device=device, dtype=torch.uint8)
-                )
+            elif qweight_type in (WeightType.Q6_K, WeightType.Q8_0):
+                raw_weight = raw_weight.detach().to(device=device, dtype=torch.uint8)
+                if qweight_type == WeightType.Q6_K:
+                    kind = "q6_k"
+                    group_size = 16
+                    weights, scales = _xpu_prepare_q6_k(raw_weight)
+                else:
+                    kind = "q8_0"
+                    group_size = 32
+                    weights, scales = _xpu_prepare_q8_0(raw_weight)
+                if gdn_col_perm is not None:
+                    weights, scales = _xpu_permute_grouped_k(
+                        weights, scales, gdn_col_perm, group_size
+                    )
                 layer.register_buffer(
                     f"{prefix}_weight", weights.unsqueeze(0), persistent=False
                 )
                 layer.register_buffer(
                     f"{prefix}_scales", scales.unsqueeze(0), persistent=False
                 )
-                representations.append(("q8_0", prefix, shard_id, None))
+                representations.append((kind, prefix, shard_id, None))
             else:
                 weight = _xpu_reference_dequantize(
                     raw_weight, qweight_type, self.params_dtype
@@ -1071,6 +1163,29 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         )
         return output.reshape(*x.shape[:-1], output_features)
 
+    @staticmethod
+    def _apply_q6_k(
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        prefix: str,
+    ) -> torch.Tensor:
+        weight = getattr(layer, f"{prefix}_weight")
+        scales = getattr(layer, f"{prefix}_scales")
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(f"GGUF XPU Q6_K expects BF16/FP16, got {x.dtype}")
+        output_features = weight.shape[1]
+        x_2d = x.reshape(-1, x.shape[-1])
+        output = torch.empty(
+            (x_2d.shape[0], output_features), dtype=x.dtype, device=x.device
+        )
+        rows_per_expert = torch.full(
+            (1,), x_2d.shape[0], dtype=torch.int32, device=x.device
+        )
+        torch.ops.sgl_kernel.gguf_q6_k_grouped_mm(
+            output, x_2d, weight, scales, rows_per_expert, 1
+        )
+        return output.reshape(*x.shape[:-1], output_features)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1082,6 +1197,8 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
             weight = getattr(layer, f"{prefix}_weight")
             if kind == "q4_k":
                 outputs.append(self._apply_q4_k(layer, x, prefix))
+            elif kind == "q6_k":
+                outputs.append(self._apply_q6_k(layer, x, prefix))
             elif kind == "q8_0":
                 outputs.append(self._apply_q8_0(layer, x, prefix))
             else:
