@@ -826,7 +826,17 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             routed_output = torch.empty(
                 (num_routes, hidden_size), dtype=x.dtype, device=device
             )
-            if layer.w2_xpu_kind in ("q5_1", "q5_k"):
+            if layer.w2_xpu_kind == "q5_1":
+                torch.ops.sgl_kernel.gguf_q5_1_grouped_mm(
+                    routed_output,
+                    activated,
+                    layer.w2_xpu_qweight,
+                    layer.w2_xpu_scales,
+                    layer.w2_xpu_minimums,
+                    expert_rows,
+                    num_experts,
+                )
+            elif layer.w2_xpu_kind == "q5_k":
                 torch.ops.sgl_kernel.gguf_q5_k_grouped_mm(
                     routed_output,
                     activated,
@@ -1489,6 +1499,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         prefix: str,
+        op_name: str = "gguf_q5_k_grouped_mm",
     ) -> torch.Tensor:
         weight = getattr(layer, f"{prefix}_weight")
         scales = getattr(layer, f"{prefix}_scales")
@@ -1503,7 +1514,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         rows_per_expert = torch.full(
             (1,), x_2d.shape[0], dtype=torch.int32, device=x.device
         )
-        torch.ops.sgl_kernel.gguf_q5_k_grouped_mm(
+        getattr(torch.ops.sgl_kernel, op_name)(
             output, x_2d, weight, scales, minimums, rows_per_expert, 1
         )
         return output.reshape(*x.shape[:-1], output_features)
@@ -1519,7 +1530,13 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
             weight = getattr(layer, f"{prefix}_weight")
             if kind == "q4_k":
                 outputs.append(self._apply_q4_k(layer, x, prefix))
-            elif kind in ("q5_1", "q5_k"):
+            elif kind == "q5_1":
+                outputs.append(
+                    self._apply_q5_k(
+                        layer, x, prefix, op_name="gguf_q5_1_grouped_mm"
+                    )
+                )
+            elif kind == "q5_k":
                 outputs.append(self._apply_q5_k(layer, x, prefix))
             elif kind == "q6_k":
                 outputs.append(self._apply_q6_k(layer, x, prefix))

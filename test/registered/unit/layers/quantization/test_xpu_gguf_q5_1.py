@@ -82,7 +82,7 @@ def test_xpu_gguf_q5_1_linear_dispatch_passes_scale_and_minimum(monkeypatch):
 
     monkeypatch.setattr(
         torch.ops.sgl_kernel,
-        "gguf_q5_k_grouped_mm",
+        "gguf_q5_1_grouped_mm",
         fake_grouped_mm,
         raising=False,
     )
