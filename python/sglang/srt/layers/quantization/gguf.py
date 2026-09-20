@@ -608,11 +608,11 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
 
     The Q4_K gate/up projection stays quantized and runs through
     sgl-kernel-xpu's compact-metadata Q4_K grouped GEMM.  GGUF files commonly
-    use a higher precision type for the down projection. Q5_K uses an affine
-    INT8-code grouped GEMM, while IQ3_S, IQ4_NL, IQ4_XS, Q3_K, Q6_K, and Q8_0
-    use signed-INT8 grouped GEMMs. Remaining types are dequantized once at load
-    time and consumed by the native grouped BF16 GEMM. This preserves the
-    checkpoint values instead of silently requantizing them to four bits.
+    use a higher precision type for the down projection. Q5_1 and Q5_K use an
+    affine INT8-code grouped GEMM, while IQ3_S, IQ4_NL, IQ4_XS, Q3_K, Q6_K,
+    and Q8_0 use signed-INT8 grouped GEMMs. Remaining types are dequantized once
+    at load time and consumed by the native grouped BF16 GEMM. This preserves
+    the checkpoint values instead of silently requantizing them to four bits.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
@@ -660,6 +660,7 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             WeightType.IQ4_NL,
             WeightType.IQ4_XS,
             WeightType.Q3_K,
+            WeightType.Q5_1,
             WeightType.Q5_K,
             WeightType.Q6_K,
             WeightType.Q8_0,
@@ -683,6 +684,9 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             elif w2_type == WeightType.Q3_K:
                 weights, scales = _xpu_prepare_q3_k(raw_w2)
                 layer.w2_xpu_kind = "q3_k"
+            elif w2_type == WeightType.Q5_1:
+                weights, scales, minimums = _xpu_prepare_q5_1(raw_w2)
+                layer.w2_xpu_kind = "q5_1"
             elif w2_type == WeightType.Q5_K:
                 weights, scales, minimums = _xpu_prepare_q5_k(raw_w2)
                 layer.w2_xpu_kind = "q5_k"
@@ -758,6 +762,7 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             "iq3_s",
             "iq4_nl",
             "iq4_xs",
+            "q5_1",
             "q5_k",
             "q3_k",
             "q6_k",
@@ -812,6 +817,7 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             "iq3_s",
             "iq4_nl",
             "iq4_xs",
+            "q5_1",
             "q5_k",
             "q3_k",
             "q6_k",
@@ -820,7 +826,7 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
             routed_output = torch.empty(
                 (num_routes, hidden_size), dtype=x.dtype, device=device
             )
-            if layer.w2_xpu_kind == "q5_k":
+            if layer.w2_xpu_kind in ("q5_1", "q5_k"):
                 torch.ops.sgl_kernel.gguf_q5_k_grouped_mm(
                     routed_output,
                     activated,
@@ -1162,6 +1168,33 @@ def _xpu_prepare_q5_k(
     return weights, scales, minimums
 
 
+def _xpu_prepare_q5_1(
+    raw_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare Q5_1 INT8 codes with one FP16 scale/offset per 32 values."""
+    block_bytes = 24
+    values_per_block = 32
+    if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 2:
+        raise ValueError("Q5_1 preparation expects a rank-2 uint8 tensor")
+    if raw_weight.shape[0] == 0:
+        raise ValueError("Q5_1 preparation expects at least one row")
+    if raw_weight.shape[1] == 0 or raw_weight.shape[1] % block_bytes:
+        raise ValueError(f"Q5_1 byte width must be a multiple of {block_bytes}")
+    device = torch.device("xpu", torch.xpu.current_device())
+    raw_weight = raw_weight.to(device=device).contiguous()
+    rows = raw_weight.shape[0]
+    blocks = raw_weight.shape[1] // block_bytes
+    weights = torch.empty(
+        (rows, blocks * values_per_block), dtype=torch.int8, device=device
+    )
+    scales = torch.empty((rows, blocks), dtype=torch.float16, device=device)
+    minimums = torch.empty_like(scales)
+    torch.ops.sgl_kernel.gguf_q5_1_prepare(
+        raw_weight, weights, scales, minimums
+    )
+    return weights, scales, minimums
+
+
 def _xpu_permute_grouped_k(
     weights: torch.Tensor,
     scales: torch.Tensor,
@@ -1232,9 +1265,9 @@ def _xpu_permute_grouped_k_affine(
 class GGUFLinearXPUMethod(GGUFLinearMethod):
     """GGUF linear implementation backed by non-ESIMD XPU kernels.
 
-    IQ3_S, IQ4_NL, IQ4_XS, Q3_K, Q4_K, Q5_K, Q6_K, and Q8_0 weights use direct
-    sgl-kernel-xpu GEMMs. Other GGUF types are dequantized once at load time and
-    use native XPU matmul.
+    IQ3_S, IQ4_NL, IQ4_XS, Q3_K, Q4_K, Q5_1, Q5_K, Q6_K, and Q8_0 weights use
+    direct sgl-kernel-xpu GEMMs. Other GGUF types are dequantized once at load
+    time and use native XPU matmul.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
@@ -1280,6 +1313,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 WeightType.IQ4_NL,
                 WeightType.IQ4_XS,
                 WeightType.Q3_K,
+                WeightType.Q5_1,
                 WeightType.Q5_K,
                 WeightType.Q6_K,
                 WeightType.Q8_0,
@@ -1302,6 +1336,10 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                     kind = "q3_k"
                     group_size = 16
                     weights, scales = _xpu_prepare_q3_k(raw_weight)
+                elif qweight_type == WeightType.Q5_1:
+                    kind = "q5_1"
+                    group_size = 32
+                    weights, scales, minimums = _xpu_prepare_q5_1(raw_weight)
                 elif qweight_type == WeightType.Q5_K:
                     kind = "q5_k"
                     group_size = 32
@@ -1481,7 +1519,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
             weight = getattr(layer, f"{prefix}_weight")
             if kind == "q4_k":
                 outputs.append(self._apply_q4_k(layer, x, prefix))
-            elif kind == "q5_k":
+            elif kind in ("q5_1", "q5_k"):
                 outputs.append(self._apply_q5_k(layer, x, prefix))
             elif kind == "q6_k":
                 outputs.append(self._apply_q6_k(layer, x, prefix))
