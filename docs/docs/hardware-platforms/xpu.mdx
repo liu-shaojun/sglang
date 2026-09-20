@@ -129,12 +129,12 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
-## GGUF Q4_K Inference
+## GGUF Inference
 
 Intel XPU supports text-generation checkpoints in the GGUF Q4_K family through
-the SYCL-TLA kernels provided by `sgl-kernel-xpu`. GGUF Q4_K values are repacked
-once while their 16-byte super-block metadata stays compact; the serving path
-does not depend on the llm-scaler ESIMD extension.
+the SYCL-TLA kernels provided by `sgl-kernel-xpu`. Q4_K and Q8_0 values are
+prepared once while their block metadata stays compact; the serving path does
+not depend on the llm-scaler ESIMD extension.
 
 Place the Hugging Face sidecar files next to the GGUF file. At minimum this
 includes `config.json`, the tokenizer files, and
@@ -183,8 +183,9 @@ Validated checkpoints:
 Current limitations:
 
 - The optimized packed path targets Xe2/BMG Intel GPUs.
-- Q4_K linear and MoE gate/up weights use the direct compact-metadata kernel.
-  Other K-quant MoE down projections are dequantized once to BF16 during loading.
+- Q4_K linear and MoE gate/up weights use the direct compact-metadata kernel;
+  Q8_0 linear and MoE down weights use the direct signed-INT8 kernel. Other
+  K-quant projections are dequantized once during loading.
 - CUDA, ROCm, and other accelerator backends are outside this XPU validation
   scope.
 
