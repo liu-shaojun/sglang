@@ -607,19 +607,14 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
     """Hybrid non-ESIMD GGUF MoE implementation for Intel XPU.
 
     The Q4_K gate/up projection stays quantized and runs through
-    sgl-kernel-xpu's INT4 W4A16 grouped GEMM.  GGUF files commonly use a
-    higher precision type (Q5_K/Q6_K/Q5_1/Q8_0) for the down projection; it
-    is dequantized once at load time and consumed by the native grouped FP16
-    GEMM.  This preserves the checkpoint values instead of silently
+    sgl-kernel-xpu's compact-metadata Q4_K grouped GEMM.  GGUF files commonly
+    use a higher precision type (Q5_K/Q6_K/Q5_1/Q8_0) for the down projection;
+    it is dequantized once at load time and consumed by the native grouped
+    FP16 GEMM.  This preserves the checkpoint values instead of silently
     requantizing the down projection to four bits.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        from sglang.srt.layers.quantization.xpu_gguf_q4_k import (
-            W4A16_GROUP_SIZE,
-            repack_q4_k_to_w4a16,
-        )
-
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
 
@@ -635,35 +630,21 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
 
         device = w13.device
         num_experts, output_features, packed_width = w13.shape
-        repacked = repack_q4_k_to_w4a16(
+        packed, metadata = _xpu_prepare_q4_k(
             w13.detach()
-            .to(device="cpu", dtype=torch.uint8)
+            .to(device=device, dtype=torch.uint8)
             .reshape(num_experts * output_features, packed_width)
         )
-        logical_width = repacked.qweight.shape[-1]
-        scale_width = repacked.scales.shape[-1]
         layer.register_buffer(
             "w13_xpu_qweight",
-            repacked.qweight.reshape(num_experts, output_features, logical_width).to(
-                device=device
-            ),
+            packed.reshape(num_experts, output_features, packed.shape[-1]),
             persistent=False,
         )
         layer.register_buffer(
-            "w13_xpu_scale",
-            repacked.scales.reshape(num_experts, output_features, scale_width).to(
-                device=device, dtype=self.params_dtype
-            ),
+            "w13_xpu_metadata",
+            metadata.reshape(num_experts, output_features, metadata.shape[-1]),
             persistent=False,
         )
-        layer.register_buffer(
-            "w13_xpu_zero",
-            repacked.zeros.reshape(num_experts, output_features, scale_width).to(
-                device=device, dtype=self.params_dtype
-            ),
-            persistent=False,
-        )
-        layer._gguf_xpu_w13_group_size = W4A16_GROUP_SIZE
 
         w2 = layer.w2_qweight
         w2_type = WeightType(layer.w2_qweight_type.weight_type)
@@ -744,17 +725,13 @@ class GGUFMoEXPUMethod(GGUFMoEMethod):
         gate_up = torch.empty(
             (num_routes, 2 * intermediate_size), dtype=x.dtype, device=device
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        torch.ops.sgl_kernel.gguf_q4_k_grouped_mm(
             gate_up,
             routed_x,
             layer.w13_xpu_qweight,
-            layer.w13_xpu_scale,
-            layer.w13_xpu_zero,
-            None,
+            layer.w13_xpu_metadata,
             expert_rows,
             num_experts,
-            True,
-            layer._gguf_xpu_w13_group_size,
         )
         activated = torch.empty(
             (num_routes, intermediate_size), dtype=x.dtype, device=device
@@ -859,20 +836,52 @@ def _xpu_reference_dequantize(
     return torch.from_numpy(np.array(dequantized, copy=True)).to(dtype=dtype)
 
 
+def _xpu_prepare_q4_k(
+    raw_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare Q4_K values plus their compact 16-byte super-block metadata."""
+    from sglang.srt.layers.quantization.xpu_gguf_q4_k import (
+        Q4_K_BLOCK_BYTES,
+        Q4_K_SUPER_BLOCK_SIZE,
+    )
+
+    if raw_weight.dtype != torch.uint8 or raw_weight.ndim != 2:
+        raise ValueError("Q4_K preparation expects a rank-2 uint8 tensor")
+    if raw_weight.shape[0] == 0:
+        raise ValueError("Q4_K preparation expects at least one row")
+    if raw_weight.shape[1] == 0 or raw_weight.shape[1] % Q4_K_BLOCK_BYTES:
+        raise ValueError(
+            f"Q4_K byte width must be a multiple of {Q4_K_BLOCK_BYTES}"
+        )
+    # GGUF mixed-type shards can live in an unregistered data_container, so
+    # device_loading_context cannot stage them together with the module's
+    # registered parameters.  The prepare op is XPU-only; move the source to
+    # the current worker device explicitly before dispatching it.
+    device = torch.device("xpu", torch.xpu.current_device())
+    raw_weight = raw_weight.to(device=device).contiguous()
+    rows = raw_weight.shape[0]
+    blocks = raw_weight.shape[1] // Q4_K_BLOCK_BYTES
+    packed = torch.empty(
+        (rows, blocks * Q4_K_SUPER_BLOCK_SIZE // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    metadata = torch.empty(
+        (rows, blocks * 16), dtype=torch.uint8, device=device
+    )
+    torch.ops.sgl_kernel.gguf_q4_k_prepare(raw_weight, packed, metadata)
+    return packed, metadata
+
+
 class GGUFLinearXPUMethod(GGUFLinearMethod):
     """GGUF linear implementation backed by non-ESIMD XPU kernels.
 
-    Q4_K weights are repacked once into the unsigned INT4 layout consumed by
-    sgl-kernel-xpu's W4A16 grouped GEMM.  Other GGUF types are dequantized once
+    Q4_K weights retain their compact metadata and use sgl-kernel-xpu's direct
+    Q4_K grouped GEMM.  Other GGUF types are dequantized once
     at load time and use the native XPU matmul as a correctness fallback.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        from sglang.srt.layers.quantization.xpu_gguf_q4_k import (
-            W4A16_GROUP_SIZE,
-            repack_q4_k_to_w4a16,
-        )
-
         shards = list(_xpu_gguf_weight_shards(layer))
         if not shards:
             raise ValueError("GGUF XPU linear has no loaded weight shards")
@@ -889,26 +898,17 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         for index, (shard_id, raw_weight, qweight_type) in enumerate(shards):
             prefix = f"_gguf_xpu_{index}"
             if qweight_type == WeightType.Q4_K and gdn_col_perm is None:
-                repacked = repack_q4_k_to_w4a16(
-                    raw_weight.detach().to(device="cpu", dtype=torch.uint8)
+                packed, metadata = _xpu_prepare_q4_k(
+                    raw_weight.detach().to(device=device, dtype=torch.uint8)
                 )
                 layer.register_buffer(
                     f"{prefix}_weight",
-                    repacked.qweight.unsqueeze(0).to(device=device),
+                    packed.unsqueeze(0),
                     persistent=False,
                 )
                 layer.register_buffer(
-                    f"{prefix}_scale",
-                    repacked.scales.unsqueeze(0).to(
-                        device=device, dtype=self.params_dtype
-                    ),
-                    persistent=False,
-                )
-                layer.register_buffer(
-                    f"{prefix}_zero",
-                    repacked.zeros.unsqueeze(0).to(
-                        device=device, dtype=self.params_dtype
-                    ),
+                    f"{prefix}_metadata",
+                    metadata.unsqueeze(0),
                     persistent=False,
                 )
                 representations.append(
@@ -916,7 +916,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                         "q4_k",
                         prefix,
                         shard_id,
-                        W4A16_GROUP_SIZE,
+                        None,
                     )
                 )
             else:
@@ -961,15 +961,11 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         layer: torch.nn.Module,
         x: torch.Tensor,
         prefix: str,
-        group_size: int,
     ) -> torch.Tensor:
         packed_weight = getattr(layer, f"{prefix}_weight")
-        scales = getattr(layer, f"{prefix}_scale")
-        zeros = getattr(layer, f"{prefix}_zero")
-        if x.dtype != scales.dtype:
-            raise TypeError(
-                f"GGUF XPU W4A16 expects {scales.dtype} activations, got {x.dtype}"
-            )
+        metadata = getattr(layer, f"{prefix}_metadata")
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(f"GGUF XPU Q4_K expects BF16/FP16, got {x.dtype}")
         output_features = packed_weight.shape[1]
         x_2d = x.reshape(-1, x.shape[-1])
         output = torch.empty(
@@ -978,17 +974,13 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         rows_per_expert = torch.full(
             (1,), x_2d.shape[0], dtype=torch.int32, device=x.device
         )
-        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        torch.ops.sgl_kernel.gguf_q4_k_grouped_mm(
             output,
             x_2d,
             packed_weight,
-            scales,
-            zeros,
-            None,
+            metadata,
             rows_per_expert,
             1,
-            True,
-            group_size,
         )
         return output.reshape(*x.shape[:-1], output_features)
 
@@ -999,10 +991,10 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         outputs = []
-        for kind, prefix, _shard_id, group_size in layer._gguf_xpu_representations:
+        for kind, prefix, _shard_id, _kernel_arg in layer._gguf_xpu_representations:
             weight = getattr(layer, f"{prefix}_weight")
             if kind == "q4_k":
-                outputs.append(self._apply_q4_k(layer, x, prefix, group_size))
+                outputs.append(self._apply_q4_k(layer, x, prefix))
             else:
                 outputs.append(torch.matmul(x, weight.T))
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)

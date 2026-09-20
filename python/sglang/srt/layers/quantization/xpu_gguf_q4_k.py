@@ -1,8 +1,8 @@
 """CPU/PyTorch helpers for a Q4_K-to-W4A16 conversion.
 
-This module deliberately contains no XPU kernel import or loader integration.
-It defines the compact logical input expected by a future unsigned-INT4 W4A16
-consumer while keeping the conversion easy to validate on CPU.
+This module deliberately contains no XPU kernel import.  It defines an expanded
+affine W4A16 reference that keeps the Q4_K formulas easy to validate on CPU;
+the serving path uses the compact-metadata kernel directly.
 
 GGUF 0.19 Q4_K stores 256 values in a 144-byte super-block.  Its eight
 32-value groups have independent six-bit scale and minimum multipliers.  The
